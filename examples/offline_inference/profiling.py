@@ -33,6 +33,7 @@ class ProfileContext:
     complete_num_requests_per_step: Optional[int] = None
 
     save_chrome_traces_folder: Optional[str] = None
+    output_len: int = None
 
 
 def get_dtype(dtype: str):
@@ -358,6 +359,35 @@ def run_profile(context: ProfileContext, csv_output: Optional[str],
         print("Traces saved as prefill.json and decode_1.json, etc."
               f" in folder {context.save_chrome_traces_folder}")
 
+def run_profile_combined(context:ProfileContext):
+    import numpy as np
+    # Create sampling params
+    sampling_params = SamplingParams(
+        temperature=0.8,
+        top_p=0.95,
+        # max_tokens is set on a per-request basis.
+        max_tokens=context.output_len)
+    llm = LLM(**asdict(context.engine_args))
+    dummy_prompt_token_ids = np.random.randint(10000,
+                                               size=(context.batch_size,
+                                                     context.prompt_len))
+    
+    dummy_prompts = [{"prompt_token_ids": batch} for batch in dummy_prompt_token_ids.tolist()]
+
+    def run_to_completion():
+        llm.generate(dummy_prompts, sampling_params=sampling_params, use_tqdm=False)
+    run_to_completion()
+    print("warming up...")
+    for _ in range(5):
+        run_to_completion()
+    
+    print("profiling...")
+    PROFILE_ITERS = 1
+    with layerwise_profile() as prof:
+        for _ in range(PROFILE_ITERS):
+            run_to_completion()
+    
+    prof.profiler.export_chrome_trace(context.save_chrome_traces_folder + f"/trace_bs{context.batch_size}_inputlen{context.prompt_len}_outlen{context.output_len}.json")
 
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(description="""
@@ -415,6 +445,16 @@ Profile a model
                         default=BATCH_SIZE_DEFAULT,
                         help=f"Number of requests to run as a single batch, "
                         f"default={BATCH_SIZE_DEFAULT}")
+    parser.add_argument(
+        "--output-len",
+        type=int,
+        default=5,
+        help=f"output len default 5, this is used when --run-profile-combined is enabled.")
+    parser.add_argument(
+        '--run-profile-combined',
+        action='store_true',
+        default=False,
+        help="True if you want to combine prefill and decode steps together.")
 
     subparsers = parser.add_subparsers(dest="cmd")
 
@@ -457,4 +497,7 @@ Profile a model
             for k, v in vars(args).items()
             if k in inspect.signature(ProfileContext).parameters
         })
-    run_profile(context, csv_output=args.csv, json_output=args.json)
+    if not args.run_profile_combined:
+        run_profile(context, csv_output=args.csv, json_output=args.json)
+    else:
+        run_profile_combined(context)
