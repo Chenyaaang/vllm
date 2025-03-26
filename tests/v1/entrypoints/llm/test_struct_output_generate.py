@@ -40,7 +40,7 @@ def test_guided_json_completion(
     outputs = llm.generate(prompts=[
         f"Give an example JSON for an employee profile "
         f"that fits this schema: {sample_json_schema}"
-    ],
+    ] * 2,
                            sampling_params=sampling_params,
                            use_tqdm=True)
 
@@ -53,7 +53,8 @@ def test_guided_json_completion(
 
         generated_text = output.outputs[0].text
         assert generated_text is not None
-        print(f"Prompt: {prompt!r}, \n Generated text: {generated_text!r}")
+        assert "\n" not in generated_text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
         output_json = json.loads(generated_text)
         jsonschema.validate(instance=output_json, schema=sample_json_schema)
 
