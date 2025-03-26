@@ -35,7 +35,9 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine  # type: ignore
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.engine.multiprocessing.engine import run_mp_engine
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import load_chat_template
+from vllm.entrypoints.chat_utils import (load_chat_template,
+                                         resolve_hf_chat_template,
+                                         resolve_mistral_chat_template)
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.cli_args import (make_arg_parser,
@@ -82,8 +84,11 @@ from vllm.entrypoints.openai.serving_transcription import (
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import (
+    maybe_register_config_serialize_by_value)
+from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import (FlexibleArgumentParser, get_open_zmq_ipc_path,
+from vllm.utils import (Device, FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address, set_ulimit)
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -220,6 +225,9 @@ async def build_async_engine_client_from_engine_args(
         # the current process might have CUDA context,
         # so we need to spawn a new process
         context = multiprocessing.get_context("spawn")
+
+        # Ensure we can serialize transformer config before spawning
+        maybe_register_config_serialize_by_value()
 
         # The Process can raise an exception during startup, which may
         # not actually result in an exitcode being reported. As a result
@@ -672,8 +680,12 @@ if envs.VLLM_SERVER_DEV_MODE:
         Reset the prefix cache. Note that we currently do not check if the
         prefix cache is successfully reset in the API server.
         """
-        logger.info("Resetting prefix cache...")
-        await engine_client(raw_request).reset_prefix_cache()
+        device = None
+        device_str = raw_request.query_params.get("device")
+        if device_str is not None:
+            device = Device[device_str.upper()]
+        logger.info("Resetting prefix cache with specific %s...", str(device))
+        await engine_client(raw_request).reset_prefix_cache(device)
         return Response(status_code=200)
 
     @router.post("/sleep")
@@ -693,6 +705,12 @@ if envs.VLLM_SERVER_DEV_MODE:
         # FIXME: in v0 with frontend multiprocessing, the wake-up command
         # is sent but does not finish yet when we return a response.
         return Response(status_code=200)
+
+    @router.get("/is_sleeping")
+    async def is_sleeping(raw_request: Request):
+        logger.info("check whether the engine is sleeping")
+        is_sleeping = await engine_client(raw_request).is_sleeping()
+        return JSONResponse(content={"is_sleeping": is_sleeping})
 
 
 @router.post("/invocations", dependencies=[Depends(validate_json_request)])
@@ -868,8 +886,26 @@ async def init_app_state(
 
     resolved_chat_template = load_chat_template(args.chat_template)
     if resolved_chat_template is not None:
-        logger.info("Using supplied chat template:\n%s",
-                    resolved_chat_template)
+        # Get the tokenizer to check official template
+        tokenizer = await engine_client.get_tokenizer()
+
+        if isinstance(tokenizer, MistralTokenizer):
+            # The warning is logged in resolve_mistral_chat_template.
+            resolved_chat_template = resolve_mistral_chat_template(
+                chat_template=resolved_chat_template)
+        else:
+            hf_chat_template = resolve_hf_chat_template(
+                tokenizer,
+                chat_template=None,
+                tools=None,
+                trust_remote_code=model_config.trust_remote_code)
+
+            if hf_chat_template != resolved_chat_template:
+                logger.warning(
+                    "Using supplied chat template: %s\n"
+                    "It is different from official chat template '%s'. "
+                    "This discrepancy may lead to performance degradation.",
+                    resolved_chat_template, args.model)
 
     state.openai_serving_models = OpenAIServingModels(
         engine_client=engine_client,
@@ -1021,6 +1057,9 @@ async def run_server(args, **uvicorn_kwargs) -> None:
             host=args.host,
             port=args.port,
             log_level=args.uvicorn_log_level,
+            # NOTE: When the 'disable_uvicorn_access_log' value is True,
+            # no access log will be output.
+            access_log=not args.disable_uvicorn_access_log,
             timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
             ssl_keyfile=args.ssl_keyfile,
             ssl_certfile=args.ssl_certfile,

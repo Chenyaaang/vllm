@@ -192,9 +192,13 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "SolarForCausalLM": _HfExamplesInfo("upstage/solar-pro-preview-instruct"),
     "TeleChat2ForCausalLM": _HfExamplesInfo("Tele-AI/TeleChat2-3B",
                                             trust_remote_code=True),
+    "TeleFLMForCausalLM": _HfExamplesInfo("CofeAI/FLM-2-52B-Instruct-2407",
+                                            trust_remote_code=True),
     "XverseForCausalLM": _HfExamplesInfo("xverse/XVERSE-7B-Chat",
                                          is_available_online=False,
                                          trust_remote_code=True),
+    "Zamba2ForCausalLM": _HfExamplesInfo("Zyphra/Zamba2-7B-instruct",
+                                         min_transformers_version="4.49"),
     # [Encoder-decoder]
     "BartModel": _HfExamplesInfo("facebook/bart-base"),
     "BartForConditionalGeneration": _HfExamplesInfo("facebook/bart-large-cnn"),
@@ -315,7 +319,7 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
 }
 
 _FALLBACK_MODEL = {
-    "TransformersModel": _HfExamplesInfo("ArthurZ/Ilama-3.2-1B", trust_remote_code=True),  # noqa: E501
+    "TransformersForCausalLM": _HfExamplesInfo("ArthurZ/Ilama-3.2-1B", trust_remote_code=True),  # noqa: E501
 }
 
 _EXAMPLE_MODELS = {
