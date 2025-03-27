@@ -463,7 +463,6 @@ class TPUModelRunner:
         # partial request, we do so for simplicity. We will ignore the sampled
         # token from the partial request.
         # TODO: Support prompt logprobs.
-        # here it pad to 64, but bitmask still has batch size = 1
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
             num_reqs, self.max_num_reqs)
         # Indices at which we sample (positions of last token in the sequence).

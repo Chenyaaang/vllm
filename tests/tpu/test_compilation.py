@@ -5,7 +5,6 @@ import os
 import tempfile
 
 import depyf
-import pytest
 
 
 def test_tpu_compilation():
