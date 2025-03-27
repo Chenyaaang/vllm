@@ -53,7 +53,6 @@ def test_guided_json_completion(
 
         generated_text = output.outputs[0].text
         assert generated_text is not None
-        assert "\n" not in generated_text
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
         output_json = json.loads(generated_text)
         jsonschema.validate(instance=output_json, schema=sample_json_schema)
@@ -97,6 +96,7 @@ def test_guided_json_completion_disable_any_whitespace(
 
         generated_text = output.outputs[0].text
         assert generated_text is not None
+        assert "\n" not in generated_text
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
         output_json = json.loads(generated_text)
         jsonschema.validate(instance=output_json, schema=sample_json_schema)
