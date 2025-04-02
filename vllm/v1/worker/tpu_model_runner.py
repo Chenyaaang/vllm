@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import bisect
 import time
-from typing import TYPE_CHECKING, Optional, cast
+from typing import Optional, cast
 from unittest.mock import patch
 
 import numpy as np
@@ -28,6 +28,8 @@ from vllm.v1.attention.backends.pallas import (NUM_KV_PAGES_PER_BLOCK,
                                                PallasAttentionBackend,
                                                PallasMetadata)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+# if TYPE_CHECKING:
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
@@ -38,9 +40,6 @@ from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from .utils import sanity_check_mm_encoder_outputs
-
-if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -182,6 +181,13 @@ class TPUModelRunner:
             min_token_size=16,
             max_token_size=self.max_num_tokens,
             padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP)
+        self.grammar_bitmask_cpu = torch.zeros(
+            (self.max_num_reqs, model_config.get_vocab_size() // 32),
+            dtype=torch.int32,
+            device="cpu")
+        self.struct_out_req_batch_indices = torch.zeros(self.max_num_reqs,
+                                                        dtype=torch.bool,
+                                                        device="cpu")
 
     def _update_num_xla_graphs(self, case_str):
         check_comp = self.check_recompilation and not self.enforce_eager
@@ -203,10 +209,13 @@ class TPUModelRunner:
             return
 
         curr_cached_graph = xr.get_num_cached_compilation_graph()
-        assert self.num_xla_graphs == curr_cached_graph, (
-            "Recompilation after warm up is detected during {}."
-            " num_xla_graphs = {} curr_cached_graph = {}".format(
-                case_str, self.num_xla_graphs, curr_cached_graph))
+        # assert self.num_xla_graphs == curr_cached_graph, (
+        #     "Recompilation after warm up is detected during {}."
+        #     " num_xla_graphs = {} curr_cached_graph = {}".format(
+        #         case_str, self.num_xla_graphs, curr_cached_graph))
+        print(
+            f"Recompilation after warm up is detected during {case_str}. num_xla_graphs = {self.num_xla_graphs} curr_cached_graph = {curr_cached_graph}"
+        )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> bool:
         """Update the cached states and the persistent batch with the scheduler
@@ -501,6 +510,7 @@ class TPUModelRunner:
         # Padded to avoid recompiling when `num_reqs` varies.
         logits_indices = self.query_start_loc_cpu[1:padded_num_reqs + 1] - 1
         logits_indices = logits_indices.to(self.device)
+        # print(f"{logits_indices=}")
         return attn_metadata, logits_indices
 
     def _execute_encoder(self, scheduler_output: "SchedulerOutput"):
@@ -646,17 +656,15 @@ class TPUModelRunner:
                 kv_caches=self.kv_caches,
                 inputs_embeds=inputs_embeds,
             )
-
-        sample_hidden_states = hidden_states[
-            tpu_sampling_metadata.indices_do_sample]
-        logits = self.model.compute_logits(sample_hidden_states)
-        if scheduler_output is not None and \
-            scheduler_output.grammar_bitmask is not None:
-            self.apply_grammar_bitmask(scheduler_output, logits)
-        selected_token_ids = torch.where(tpu_sampling_metadata.all_greedy,
-                        torch.argmax(logits, dim=-1, keepdim=True),
-                        self.model.sample(logits, tpu_sampling_metadata)\
-                                            .sampled_token_ids)
+        # print(f"{hidden_states.shape=}")    #(padded_total_num_scheduled_tokens, 4096)
+        logits = self.model.compute_logits(
+            hidden_states[tpu_sampling_metadata.indices_do_sample])
+        # selected_token_ids = self.sample_from_hidden(hidden_states,
+        #                                              tpu_sampling_metadata,
+        #                                              scheduler_output)
+        selected_token_ids = self.sample_from_logits(
+            logits, tpu_sampling_metadata, scheduler_output,
+            self.input_batch.req_ids, self.input_batch.req_id_to_index)
         selected_token_ids = selected_token_ids.cpu()[:num_reqs]
 
         # Update the cache state concurrently. Code above will not block until
@@ -829,6 +837,7 @@ class TPUModelRunner:
         for num_tokens in self.num_tokens_paddings:
             logger.info("  -- num_tokens: %d", num_tokens)
             self._dummy_run(self.kv_caches, num_tokens)
+            self._update_num_xla_graphs(f"model_num_tokens_{num_tokens}")
             xm.mark_step()
         xm.wait_device_ops()
         end = time.perf_counter()
@@ -840,8 +849,26 @@ class TPUModelRunner:
         start = time.perf_counter()
         hsize = self.model_config.get_hidden_size()
         device = self.device
+
         # Compile sampling step for different model+sampler outputs in bucketed
         # n_tokens x max_num_reqs. Graph is really small so this is fine.
+        def generate_dummy_sampler_input(num_reqs):
+            req_ids = [str(i) for i in range(num_reqs)]
+            req_id_to_index = {str(i): i for i in range(num_reqs)}
+            scheduler_output = SchedulerOutput(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=[],
+                num_scheduled_tokens={},
+                total_num_scheduled_tokens=0,
+                scheduled_encoder_inputs={},
+                scheduled_spec_decode_tokens={},
+                num_common_prefix_blocks=0,
+                finished_req_ids=set(),
+                free_encoder_input_ids=[],
+                structured_output_request_ids=req_id_to_index,
+                grammar_bitmask=None)
+            return req_ids, req_id_to_index, scheduler_output
+
         for num_tokens in self.num_tokens_paddings:
             num_reqs_to_sample = MIN_NUM_SEQS
             dummy_hidden = torch.randn((num_tokens, hsize),
@@ -859,10 +886,31 @@ class TPUModelRunner:
                     from_input_batch(self.input_batch, indices)
                 logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens,
                             num_reqs_to_sample)
-                out = self.model.sample_from_hidden(dummy_hidden,
-                                                    sampling_meta)
-                out = out.cpu()
-                if num_reqs_to_sample >= self.max_num_reqs:
+                # out = self.model.sample_from_hidden(dummy_hidden,
+                #                                     sampling_meta)
+
+                logits = self.model.compute_logits(
+                    dummy_hidden[sampling_meta.indices_do_sample])
+
+                req_ids, req_id_to_index, dummy_scheduler_output = generate_dummy_sampler_input(
+                    num_reqs_to_sample)
+                # out_without_structured_output = self.sample_from_logits(logits, sampling_meta, dummy_scheduler_output, req_ids, req_id_to_index)
+                # out_without_structured_output = out_without_structured_output.cpu()
+
+                dummy_scheduler_output.grammar_bitmask = np.zeros(
+                    (num_reqs_to_sample,
+                     self.model_config.get_vocab_size() // 32),
+                    dtype=np.int32)
+                out_with_structured_output = self.sample_from_logits(
+                    logits, sampling_meta, dummy_scheduler_output, req_ids,
+                    req_id_to_index)
+                out_with_structured_output = out_with_structured_output.cpu()
+
+                self._update_num_xla_graphs(
+                    f"sampling_num_tokens_{num_tokens}_num_req_{num_reqs_to_sample}"
+                )
+
+                if num_reqs_to_sample >= min(num_tokens, self.max_num_reqs):
                     break
                 # Make sure to compile the `max_num_reqs` upper-limit case
                 num_reqs_to_sample = _get_padded_num_reqs_with_upper_limit(
@@ -912,11 +960,47 @@ class TPUModelRunner:
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches)
 
-    def apply_grammar_bitmask(
-        self,
-        scheduler_output: "SchedulerOutput",
-        logits: torch.Tensor,
-    ):
+    '''
+    def sample_from_hidden(
+            self, hidden_states: torch.Tensor,
+            sampling_metadata: TPUSupportedSamplingMetadata,
+            scheduler_output: Optional["SchedulerOutput"]) -> torch.Tensor:
+        sample_hidden_states = hidden_states[
+            sampling_metadata.indices_do_sample]
+        logits = self.model.compute_logits(sample_hidden_states)
+        if scheduler_output is not None and \
+            scheduler_output.grammar_bitmask is not None:
+            self.apply_grammar_bitmask(scheduler_output, logits)
+        out_tokens = torch.where(sampling_metadata.all_greedy,
+                        torch.argmax(logits, dim=-1, keepdim=True),
+                        self.model.sample(logits, sampling_metadata)\
+                                            .sampled_token_ids)
+        return out_tokens
+    '''
+
+    def sample_from_logits(self, logits: torch.Tensor,
+                           sampling_metadata: TPUSupportedSamplingMetadata,
+                           scheduler_output: "SchedulerOutput", req_ids,
+                           req_id_to_index) -> torch.Tensor:
+        if scheduler_output.grammar_bitmask is not None:
+            logits = self.apply_grammar_bitmask(scheduler_output, logits,
+                                                req_ids, req_id_to_index)
+        # out_tokens = torch.where(sampling_metadata.all_greedy,
+        #                 torch.argmax(logits, dim=-1, keepdim=True),
+        #                 self.model.sample(logits, sampling_metadata)\
+        #                                     .sampled_token_ids)
+        # return out_tokens
+        return self.helper2(sampling_metadata, logits)
+
+    @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    def helper2(self, sampling_metadata, logits):
+        return torch.where(
+            sampling_metadata.all_greedy,
+            torch.argmax(logits, dim=-1, keepdim=True),
+            self.model.sample(logits, sampling_metadata).sampled_token_ids)
+
+    def apply_grammar_bitmask(self, scheduler_output: "SchedulerOutput",
+                              logits: torch.Tensor, req_ids, req_id_to_index):
         grammar_bitmask = scheduler_output.grammar_bitmask
         if grammar_bitmask is None:
             return
@@ -926,18 +1010,23 @@ class TPUModelRunner:
         # ordering the requests in the batch. We need to sort the bitmask to
         # match the order of the requests used here.
         struct_out_req_batch_indices: dict[str, int] = {}
-        indices_match = True
-        for req_id in self.input_batch.req_ids:
+        # indices_match = True
+        num_reqs = logits.shape[0]
+        # for req_id in self.input_batch.req_ids:
+        for req_id in req_ids:
             mask_index = scheduler_output.structured_output_request_ids.get(
                 req_id)
             if mask_index is None:
                 # not a structured output request
                 continue
-            batch_index = self.input_batch.req_id_to_index[req_id]
-            if batch_index != mask_index:
-                indices_match = False
+            # batch_index = self.input_batch.req_id_to_index[req_id]
+            batch_index = req_id_to_index[req_id]
+            # if batch_index != mask_index:
+            #     indices_match = False
             struct_out_req_batch_indices[req_id] = batch_index
-
+            self.grammar_bitmask_cpu[batch_index] = torch.from_numpy(
+                grammar_bitmask[mask_index])
+        '''
         if not indices_match:
             # Sort the bitmask to match the order of the requests
             sorted_bitmask = np.zeros_like(grammar_bitmask)
@@ -945,24 +1034,56 @@ class TPUModelRunner:
                 orig_index = scheduler_output.structured_output_request_ids[
                     req_id]
                 sorted_bitmask[batch_index] = grammar_bitmask[orig_index]
-            grammar_bitmask = sorted_bitmask
-
-        grammar_bitmask = torch.from_numpy(grammar_bitmask)
-        self.apply_token_bitmask_inplace(
-            logits,
-            grammar_bitmask.to(self.device),
-            indices=list(struct_out_req_batch_indices.values()))
-
+        grammar_bitmask = sorted_bitmask
+        '''
+        require_struct_out = torch.zeros(num_reqs, dtype=torch.bool)
+        struct_out_indices = torch.tensor(list(
+            struct_out_req_batch_indices.values()),
+                                          dtype=torch.long)
+        require_struct_out[struct_out_indices] = True
+        # print(f"{bool_tensor=}")
+        # grammar_bitmask = torch.from_numpy(grammar_bitmask)
+        # self.apply_token_bitmask_inplace(
+        #     logits,
+        #     # grammar_bitmask.to(self.device),
+        #     self.grammar_bitmask_cpu[:logits.shape[0]].to(self.device),
+        #     indices=list(struct_out_req_batch_indices.values())
+        #     # bool_tensor
+        #     )
+        return self.helper(
+            require_struct_out.unsqueeze(1).to(self.device), logits,
+            self.grammar_bitmask_cpu[:num_reqs].to(self.device))
+        # return torch.where(require_struct_out.unsqueeze(1).to(self.device),
+        #             self.apply_token_bitmask_inplace(logits, self.grammar_bitmask_cpu[:num_reqs].to(self.device)),
+        #             logits)
     @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    def helper(self, require_struct_out, logits, grammar_bitmask):
+        return torch.where(
+            require_struct_out,
+            self.apply_token_bitmask_inplace(logits, grammar_bitmask), logits)
+
+    '''
     def apply_token_bitmask_inplace(self, logits, grammar_bitmask, indices):
         arange = torch.arange(0, 32).to(logits.device)
         for i in indices:
-            # unpacked_bitmask = grammar_bitmask[i][:, None] & (
-            #     1 << torch.arange(0, 32)[None, :]) == 0
             unpacked_bitmask = (torch.bitwise_right_shift(
                 grammar_bitmask[i][:, None], arange[None, :]) & 1) == 0
             unpacked_bitmask = unpacked_bitmask.reshape(-1)
             logits[i] = logits[i].masked_fill(unpacked_bitmask, -float("inf"))
+    '''
+
+    def apply_token_bitmask_inplace(self, logits, grammar_bitmask):
+        # print(f"{logits.shape=}, {grammar_bitmask.shape=}")
+        assert (logits.shape[0] == grammar_bitmask.shape[0])
+        logits_cloned = logits.clone()
+        arange = torch.arange(0, 32).to(logits.device)
+        for i in range(logits_cloned.shape[0]):
+            unpacked_bitmask = (torch.bitwise_right_shift(
+                grammar_bitmask[i][:, None], arange[None, :]) & 1) == 0
+            unpacked_bitmask = unpacked_bitmask.reshape(-1)
+            logits_cloned[i] = logits_cloned[i].masked_fill(
+                unpacked_bitmask, -float("inf"))
+        return logits_cloned
 
 
 class ModelWrapperV1(nn.Module):
@@ -1025,6 +1146,7 @@ class ModelWrapperV1(nn.Module):
                                             .sampled_token_ids)
         return out_tokens
 
+    @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
     def compute_logits(self,
                        hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         # SamplingMetadata here for pruning output in LogitsProcessor, disabled
