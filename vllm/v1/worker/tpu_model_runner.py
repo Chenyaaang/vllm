@@ -654,8 +654,12 @@ class TPUModelRunner:
                 kv_caches=self.kv_caches,
                 inputs_embeds=inputs_embeds,
             )
-        selected_token_ids = self.model.sample_from_hidden(
-            hidden_states, tpu_sampling_metadata)
+        # selected_token_ids = self.model.sample_from_hidden(
+        #     hidden_states, tpu_sampling_metadata)
+        logits = self.model.compute_logits(
+            hidden_states[tpu_sampling_metadata.indices_do_sample])
+        selected_token_ids = self.sample_from_logits(logits,
+                                                     tpu_sampling_metadata)
         # Remove padding on cpu and keep dynamic op outside of xla graph.
         selected_token_ids = selected_token_ids.cpu()[:num_reqs]
 
@@ -736,6 +740,13 @@ class TPUModelRunner:
         self._verify_num_xla_graphs("execute_model")
 
         return model_runner_output
+
+    @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    def sample_from_logits(self, logits, sampling_metadata):
+        return torch.where(
+            sampling_metadata.all_greedy,
+            torch.argmax(logits, dim=-1, keepdim=True),
+            self.model.sample(logits, sampling_metadata).sampled_token_ids)
 
     def load_model(self) -> None:
         self.device = self.device_config.device
@@ -859,8 +870,11 @@ class TPUModelRunner:
                     from_input_batch(self.input_batch, indices)
                 logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens,
                             num_reqs_to_sample)
-                out = self.model.sample_from_hidden(dummy_hidden,
-                                                    sampling_meta)
+                # out = self.model.sample_from_hidden(dummy_hidden,
+                #                                     sampling_meta)
+                logits = self.model.compute_logits(
+                    dummy_hidden[sampling_meta.indices_do_sample])
+                out = self.sample_from_logits(logits, sampling_meta)
                 out = out.cpu()
                 # Requests can't be more than tokens. But do compile for the
                 # next bigger value in case num_tokens uses bucketed padding.
@@ -975,6 +989,7 @@ class ModelWrapperV1(nn.Module):
                                             .sampled_token_ids)
         return out_tokens
 
+    @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
     def compute_logits(self,
                        hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         # SamplingMetadata here for pruning output in LogitsProcessor, disabled
