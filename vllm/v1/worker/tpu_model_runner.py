@@ -203,6 +203,7 @@ class TPUModelRunner:
             return
 
         curr_cached_graph = xr.get_num_cached_compilation_graph()
+        print(f"{self.num_xla_graphs=}, {curr_cached_graph=}")
         assert self.num_xla_graphs == curr_cached_graph, (
             "Recompilation after warm up is detected during {}."
             " num_xla_graphs = {} curr_cached_graph = {}".format(
@@ -641,11 +642,7 @@ class TPUModelRunner:
             input_ids = self.input_ids
             inputs_embeds = None
         num_reqs = self.input_batch.num_reqs
-        # NOTE (NickLucche) here we sync with TPU: sampling params tensors
-        # are copied to device in chunks of pre-compiled padded shape to
-        # avoid recompilations.
-        tpu_sampling_metadata = TPUSupportedSamplingMetadata.\
-            from_input_batch(self.input_batch, logits_indices)
+
         # Run the decoder
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
@@ -654,12 +651,17 @@ class TPUModelRunner:
                 kv_caches=self.kv_caches,
                 inputs_embeds=inputs_embeds,
             )
+        # NOTE (NickLucche) here we sync with TPU: sampling params tensors
+        # are copied to device in chunks of pre-compiled padded shape to
+        # avoid recompilations.
+        tpu_sampling_metadata = TPUSupportedSamplingMetadata.\
+            from_input_batch(self.input_batch, logits_indices)
         # selected_token_ids = self.model.sample_from_hidden(
         #     hidden_states, tpu_sampling_metadata)
         logits = self.model.compute_logits(
             hidden_states[tpu_sampling_metadata.indices_do_sample])
-        selected_token_ids = self.sample_from_logits(logits,
-                                                     tpu_sampling_metadata)
+        selected_token_ids = self.model.sample_from_logits(
+            logits, tpu_sampling_metadata)
         # Remove padding on cpu and keep dynamic op outside of xla graph.
         selected_token_ids = selected_token_ids.cpu()[:num_reqs]
 
@@ -741,12 +743,14 @@ class TPUModelRunner:
 
         return model_runner_output
 
+    '''
     @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
     def sample_from_logits(self, logits, sampling_metadata):
         return torch.where(
             sampling_metadata.all_greedy,
             torch.argmax(logits, dim=-1, keepdim=True),
             self.model.sample(logits, sampling_metadata).sampled_token_ids)
+    '''
 
     def load_model(self) -> None:
         self.device = self.device_config.device
@@ -874,7 +878,7 @@ class TPUModelRunner:
                 #                                     sampling_meta)
                 logits = self.model.compute_logits(
                     dummy_hidden[sampling_meta.indices_do_sample])
-                out = self.sample_from_logits(logits, sampling_meta)
+                out = self.model.sample_from_logits(logits, sampling_meta)
                 out = out.cpu()
                 # Requests can't be more than tokens. But do compile for the
                 # next bigger value in case num_tokens uses bucketed padding.
@@ -989,12 +993,18 @@ class ModelWrapperV1(nn.Module):
                                             .sampled_token_ids)
         return out_tokens
 
-    @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
+    # @torch.compile(backend="openxla", fullgraph=True, dynamic=False)
     def compute_logits(self,
                        hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         # SamplingMetadata here for pruning output in LogitsProcessor, disabled
         logits = self.model.compute_logits(hidden_states, None)
         return logits
+
+    def sample_from_logits(self, logits, sampling_metadata):
+        return torch.where(
+            sampling_metadata.all_greedy,
+            torch.argmax(logits, dim=-1, keepdim=True),
+            self.sample(logits, sampling_metadata).sampled_token_ids)
 
     def get_multimodal_embeddings(self, *args, **kwargs):
         return self.model.get_multimodal_embeddings(*args, **kwargs)
