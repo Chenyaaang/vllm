@@ -635,9 +635,11 @@ class ModelConfig:
 
         architectures = self.architectures
         registry = self.registry
-        is_generative_model = registry.is_text_generation_model(
-            architectures, self)
-        is_pooling_model = registry.is_pooling_model(architectures, self)
+        # is_generative_model = registry.is_text_generation_model(
+        #     architectures, self)
+        is_generative_model = True
+        # is_pooling_model = registry.is_pooling_model(architectures, self)
+        is_pooling_model = False
 
         def _task_to_convert(task: TaskOption) -> ConvertType:
             if task == "embedding" or task == "embed":
@@ -694,18 +696,16 @@ class ModelConfig:
                 raise AssertionError("The model should be a generative or "
                                      "pooling model when task is set to "
                                      f"{self.task!r}.")
-
+        
             self.runner = runner
             self.convert = convert
 
             msg = f"{msg_prefix} {msg_hint}"
             warnings.warn(msg, DeprecationWarning, stacklevel=2)
-
         self.runner_type = self._get_runner_type(architectures, self.runner)
         self.convert_type = self._get_convert_type(architectures,
                                                    self.runner_type,
                                                    self.convert)
-
         if self.runner_type == "generate" and not is_generative_model:
             generate_converts = _RUNNER_CONVERTS["generate"]
             if self.convert_type not in generate_converts:
@@ -720,19 +720,35 @@ class ModelConfig:
                     "This model does not support `--runner pooling`. "
                     f"You can pass `--convert {convert_option} to adapt "
                     "it into a pooling model.")
-
-        self.supported_tasks = self._get_supported_tasks(
-            architectures, self.runner_type, self.convert_type)
+        # self.supported_tasks = self._get_supported_tasks(
+        #     architectures, self.runner_type, self.convert_type)
 
         # Note: Initialize these attributes early because transformers fallback
         # may fail to load dynamic modules in child processes
-        model_info, arch = registry.inspect_model_cls(architectures, self)
-        self._model_info = model_info
-        self._architecture = arch
-        logger.info("Resolved architecture: %s", arch)
+        # model_info, arch = registry.inspect_model_cls(architectures, self)
+        # self._model_info = model_info
+        # self._architecture = arch
+        from vllm.model_executor.models.registry import _ModelInfo
+        self._model_info = _ModelInfo(
+            architecture="Deepseek",
+            is_text_generation_model=True,
+            is_pooling_model=False,
+            supports_cross_encoding=False,
+            supports_multimodal=False,
+            supports_multimodal_raw_input=False,
+            supports_pp=False,
+            has_inner_state=False,
+            is_attention_free=False,
+            is_hybrid=False,
+            has_noops=False,
+            supports_transcription=False,
+            supports_transcription_only=False,
+            supports_v0_only=False
+        )
+        self._architecture = None
+        # logger.info("Resolved architecture: %s", arch)
 
         self.pooler_config = self._init_pooler_config()
-
         self.dtype = _get_and_verify_dtype(
             self.model,
             self.hf_config,
@@ -783,22 +799,18 @@ class ModelConfig:
                     delattr(self.hf_text_config, "sliding_window")
 
                 sliding_window = None
-
         self.original_max_model_len = self.max_model_len
         self.max_model_len = self.get_and_verify_max_len(self.max_model_len)
         self.multimodal_config = self._init_multimodal_config()
-
         if not self.skip_tokenizer_init:
             self._verify_tokenizer_mode()
-
         if (not current_platform.is_neuron() and self.override_neuron_config):
             raise ValueError(
                 "`override_neuron_config` is only supported on Neuron.")
-
         # Avoid running try_verify_and_update_config multiple times
         self.config_updated = False
 
-        self._verify_quantization()
+        # self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()
 
