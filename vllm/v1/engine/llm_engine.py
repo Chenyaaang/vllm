@@ -101,6 +101,7 @@ class LLMEngine:
                                                 log_stats=self.log_stats)
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
+        print(f"[debug] llm/v1/engine: LLMEngine, {multiprocess_mode=}")
         self.engine_core = EngineCoreClient.make_client(
             multiprocess_mode=multiprocess_mode,
             asyncio_mode=False,

@@ -76,8 +76,9 @@ class EngineCoreClient(ABC):
                 vllm_config, executor_class, log_stats)
 
         if multiprocess_mode and not asyncio_mode:
+            print(f"[debug] SyncMPClient")
             return SyncMPClient(vllm_config, executor_class, log_stats)
-
+        print("[debug] InprocClient")
         return InprocClient(vllm_config, executor_class, log_stats)
 
     @staticmethod

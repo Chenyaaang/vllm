@@ -957,6 +957,20 @@ def _get_kv_cache_config_uniform_page_size(
             grouped_layers.append(layers[i:i + group_size])
     kv_cache_groups = create_kv_cache_group_specs(kv_cache_spec,
                                                   grouped_layers)
+    '''
+    [Comment]
+    eg1 (full.0, full.1), (sw.0, sw.1, sw2)
+    group_size = 2
+    full doesn't need to pad
+    sw: 2 - 3 % 2 = 1 pad 1 layers
+    (full.0, full.1), (sw.0, sw.1), (sw.2, padding)
+    2 groups: (full.0, sw.0, sw.2), (full.1, sw.1, padding)
+
+    eg2: 10 full, 20 sw
+    group_size = 10
+    (full.0, ..., full.9), (sw.0, ..., sw.9), (sw.10, ..., sw.19)
+    10 groups: (full.0, sw.0, sw.10), (full.1, sw.1, sw.11), ..., (full.9, sw.9, sw.19)
+    '''
 
     # Determine how model runners should initialize the KV cache tensors.
     # We will have group_size memory pools, each is shared by one layer from
@@ -1073,8 +1087,9 @@ def get_kv_cache_config(
         The generated KVCacheConfigs
     """
     check_enough_kv_cache_memory(vllm_config, kv_cache_spec, available_memory)
+    print(f"[debug] get_kv_cache_config: {vllm_config.scheduler_config.disable_hybrid_kv_cache_manager=}")
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
-        unify_hybrid_kv_cache_specs(kv_cache_spec)
+        unify_hybrid_kv_cache_specs(kv_cache_spec)  # consolidate all into full attention spec.
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns a kv_cache config with 0 kv_cache groups and 1 block
@@ -1084,6 +1099,7 @@ def get_kv_cache_config(
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
+        print(f"[debug] get_kv_cache_config: is_kv_cache_type_uniform")
         return _get_kv_cache_config_uniform_type(vllm_config, kv_cache_spec,
                                                  available_memory)
     elif is_kv_cache_page_size_uniform(kv_cache_spec):

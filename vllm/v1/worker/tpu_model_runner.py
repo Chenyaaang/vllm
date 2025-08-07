@@ -184,6 +184,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             parallel_config)
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         self.head_size = model_config.get_head_size()
+        print(f"[debug] {self.num_kv_heads=}, {self.head_size=}")
         self.hidden_size = model_config.get_hidden_size()
         self.vocab_size = model_config.get_vocab_size()
 
@@ -523,6 +524,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     logger.warning_once(
                         "Using irope in Pallas is not supported yet, it "
                         "will fall back to global attention for long context.")
+                print(f"[debug] {layer_name=}, {attn_module.head_size=}, {attn_module.num_kv_heads=}")
                 if attn_module.sliding_window is not None:
                     kv_cache_spec[layer_name] = SlidingWindowSpec(
                         block_size=block_size,

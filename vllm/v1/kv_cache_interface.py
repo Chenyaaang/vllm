@@ -169,6 +169,8 @@ class SlidingWindowSpec(AttentionSpec):
         # `self.sliding_window-1` computed tokens plus the newly scheduled
         # tokens. And we won't allocate KV cache for more than `max_model_len`
         # tokens.
+        # [Comment]1 sliding window length + max number of tokens can be 
+        # scheduled at this round (max_num_batched_tokens).
         num_tokens = min(self.sliding_window - 1 + max_num_batched_tokens,
                          max_model_len)
 

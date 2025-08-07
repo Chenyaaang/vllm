@@ -75,6 +75,7 @@ class EngineCore:
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
+        print(f"[debug] engine core: {executor_class=}")
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(
                 executor_fail_callback)
@@ -144,9 +145,12 @@ class EngineCore:
         start = time.time()
 
         # Get all kv cache needed by the model
+        # [Comment] actual implemented by tpu_jax_runner -> get_kv_cache_spec
+        # right now each layer is a fullattention.
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
+        print(f"[debug] EngineCore {has_kv_cache=}")
         if has_kv_cache:
             if os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1":
                 dp_group = getattr(self, "dp_group", None)
@@ -166,7 +170,7 @@ class EngineCore:
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
-
+        # print(f"[debug] EngineCore {type(kv_cache_specs)=}, {len(kv_cache_specs)=}")    # a list of 1 element, since this uni proc executor.
         assert len(kv_cache_specs) == len(available_gpu_memory)
         # Get the kv cache tensor size
         kv_cache_configs = [

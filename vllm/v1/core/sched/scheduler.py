@@ -330,6 +330,9 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
+            # [Comment] If there are preempted_reqs, it means kv cache manager
+            # ran out of memory when scheduling running requests, so we don't
+            # schedule new requests any more.
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -337,6 +340,10 @@ class Scheduler(SchedulerInterface):
                 request = self.waiting.peek_request()
 
                 # KVTransfer: skip request if still waiting for remote kvs.
+                # [Comment] The scheduler has determined this request can 
+                # reuse kv cache blocks from a remote source (another worker)
+                # has allocated local memory for these blocks and is now 
+                # waiting for the async data transfer finish.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
                     if is_ready:
@@ -345,6 +352,9 @@ class Scheduler(SchedulerInterface):
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
+                        # the request isn't ready, pop from self.waiting so it
+                        # won't be consider during this schedule() cycle
+                        # it's added back to self.waiting finally.
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
@@ -374,6 +384,8 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
 
                 # Get already-cached tokens.
+                # [Comment] if the request is from remote kv transfer, 
+                # then its num_computed_tokens is not 0.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = \
@@ -381,6 +393,8 @@ class Scheduler(SchedulerInterface):
                             request)
 
                     # Get externally-cached tokens if using a KVConnector.
+                    # [Comment] this external search starts from
+                    # num_new_local_computed_tokens
                     if self.connector is not None:
                         num_external_computed_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
@@ -436,12 +450,13 @@ class Scheduler(SchedulerInterface):
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
-
+                # [Comment] prefill allocates a large chunk of slots, while 
+                # decode allocate 1 by 1 (except for spec decoding)
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
+                    num_new_tokens + num_external_computed_tokens,  #remaining tokens needed local kv cache.
+                    num_new_local_computed_tokens,  # tokens local device already computed.
+                    new_computed_blocks,    # local computed blocks?
                     num_lookahead_tokens=self.num_lookahead_tokens,
                     delay_cache_blocks=load_kv_async,
                 )

@@ -551,7 +551,7 @@ class WorkerWrapperBase:
 
         from vllm.plugins import load_general_plugins
         load_general_plugins()
-
+        print(f"[debug] worker_base/init_worker: {self.vllm_config.parallel_config.worker_cls=}")
         if isinstance(self.vllm_config.parallel_config.worker_cls, str):
             worker_class = resolve_obj_by_qualname(
                 self.vllm_config.parallel_config.worker_cls)
